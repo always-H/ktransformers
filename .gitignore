@@ -7,6 +7,8 @@ server.db
 logs
 node_modules
 *.nsys-rep
+*.log
+*.jsonl
 .vs/
 *pycache*
 *build/
@@ -20,6 +22,9 @@ ktransformers/server_test1.db
 img/
 tmp*.txt
 test.txt
+kt-kernel/sgl_kt/tp.json
+kt-kernel/sgl_kt/transfer_result.txt
+kt-kernel/sgl_kt/batch_prefill_paged_kernel_*.cu
 book
 ktransformers/tests/chat_txt.txt
 mmlu_result*

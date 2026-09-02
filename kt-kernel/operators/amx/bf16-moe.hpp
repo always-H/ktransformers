@@ -173,15 +173,18 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           int ith = task_id % nth;
 
-          // Gate: from BF16 data (no scale)
-          gate_bb_[expert_idx]->from_mat(
-              (ggml_bf16_t*)config_.gate_proj + (logical_expert_id * config_.intermediate_size * config_.hidden_size),
-              ith, nth);  // 3 parameters: (bf16*, ith, nth)
+          auto [n_start, n_end] = T::split_range_n(config_.intermediate_size, ith, nth);
+          const size_t expert_offset =
+              logical_expert_id * (size_t)config_.intermediate_size * config_.hidden_size;
+          const size_t shard_offset = (size_t)n_start * config_.hidden_size;
+          const size_t shard_elements = (size_t)(n_end - n_start) * config_.hidden_size;
 
-          // Up: same
-          up_bb_[expert_idx]->from_mat(
-              (ggml_bf16_t*)config_.up_proj + (logical_expert_id * config_.intermediate_size * config_.hidden_size),
-              ith, nth);
+          std::memcpy(gate_bb_[expert_idx]->b + shard_offset,
+                      (ggml_bf16_t*)config_.gate_proj + expert_offset + shard_offset,
+                      shard_elements * sizeof(ggml_bf16_t));
+          std::memcpy(up_bb_[expert_idx]->b + shard_offset,
+                      (ggml_bf16_t*)config_.up_proj + expert_offset + shard_offset,
+                      shard_elements * sizeof(ggml_bf16_t));
         },
         nullptr);
 
@@ -194,10 +197,15 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           int ith = task_id % nth;
 
-          // Down
-          down_bb_[expert_idx]->from_mat(
-              (ggml_bf16_t*)config_.down_proj + (logical_expert_id * config_.intermediate_size * config_.hidden_size),
-              ith, nth);
+          auto [n_start, n_end] = T::split_range_n(config_.hidden_size, ith, nth);
+          const size_t expert_offset =
+              logical_expert_id * (size_t)config_.hidden_size * config_.intermediate_size;
+          const size_t shard_offset = (size_t)n_start * config_.intermediate_size;
+          const size_t shard_elements = (size_t)(n_end - n_start) * config_.intermediate_size;
+
+          std::memcpy(down_bb_[expert_idx]->b + shard_offset,
+                      (ggml_bf16_t*)config_.down_proj + expert_offset + shard_offset,
+                      shard_elements * sizeof(ggml_bf16_t));
         },
         nullptr);
 
@@ -306,11 +314,6 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     auto& config = config_;
     auto pool = config.pool->get_subpool(tp_part_idx);
 
-    constexpr int N_STEP = T::N_STEP;
-    constexpr int K_STEP = T::K_STEP;
-    constexpr int N_BLOCK = T::N_BLOCK;
-    constexpr int K_BLOCK = T::K_BLOCK;
-
     // ========= W13 (gate+up): Shape [intermediate, hidden], split by N only =========
     const int cpu_n_w13 = config.intermediate_size;
     const int cpu_k_w13 = config.hidden_size;
@@ -327,99 +330,54 @@ class AMX_BF16_MOE_TP : public AMX_MOE_BASE<T, AMX_BF16_MOE_TP<T>> {
     const int gpu_k_w2 = full_config.intermediate_size / gpu_tp_count;
     const int global_k_offset_w2 = tp_part_idx * cpu_k_w2;
 
-    // ========= Optimized job layout =========
-    constexpr int NUM_W13_TASKS = 32;  // Per matrix (gate or up), total 64 for w13
-    constexpr int NUM_W2_TASKS = 32;   // For down matrix
+    // BufferB is kept in row-major order for the custom BF16 kernels. Export
+    // rows directly so dynamically scheduled GPU experts receive the same
+    // logical weights as the CPU kernels.
+    constexpr int NUM_W13_TASKS = 32;
+    constexpr int NUM_W2_TASKS = 32;
 
     const int total_tasks = NUM_W13_TASKS * 2 + NUM_W2_TASKS;
-
-    // Calculate N_STEP blocks per task
-    const int w13_n_steps = div_up(cpu_n_w13, N_STEP);
-    const int w13_steps_per_task = div_up(w13_n_steps, NUM_W13_TASKS);
-    const int w2_n_steps = div_up(cpu_n_w2, N_STEP);
-    const int w2_steps_per_task = div_up(w2_n_steps, NUM_W2_TASKS);
+    const int w13_rows_per_task = div_up(cpu_n_w13, NUM_W13_TASKS);
+    const int w2_rows_per_task = div_up(cpu_n_w2, NUM_W2_TASKS);
 
     pool->do_work_stealing_job(
         total_tasks, nullptr,
         [=, &w13_weight_ptrs, &w2_weight_ptrs, this](int task_id) {
           if (task_id < NUM_W13_TASKS * 2) {
-            // ========= W13 weight task: process chunk of rows x full K =========
             const bool is_up = task_id >= NUM_W13_TASKS;
             const int chunk_idx = task_id % NUM_W13_TASKS;
             const auto& bb = is_up ? up_bb_[expert_id] : gate_bb_[expert_id];
+            const int row_start = chunk_idx * w13_rows_per_task;
+            const int row_end = std::min(row_start + w13_rows_per_task, cpu_n_w13);
 
-            const int step_start = chunk_idx * w13_steps_per_task;
-            const int step_end = std::min(step_start + w13_steps_per_task, w13_n_steps);
-            if (step_start >= w13_n_steps) return;
-            const int chunk_n_start = step_start * N_STEP;
-            const int chunk_n_end = std::min(step_end * N_STEP, cpu_n_w13);
-
-            for (int local_n_start = chunk_n_start; local_n_start < chunk_n_end; local_n_start += N_STEP) {
-              const int global_n = global_n_offset_w13 + local_n_start;
+            for (int local_n = row_start; local_n < row_end; ++local_n) {
+              const int global_n = global_n_offset_w13 + local_n;
               const int target_gpu = global_n / gpu_n_w13;
               const int n_in_gpu = global_n % gpu_n_w13;
-
               ggml_bf16_t* weight_base = (ggml_bf16_t*)w13_weight_ptrs[target_gpu];
               const size_t expert_weight_off = is_up ? gpu_w13_weight_per_mat : 0;
-
-              const int n_block_idx = local_n_start / N_BLOCK;
-              const int n_block_begin = n_block_idx * N_BLOCK;
-              const int n_block_size = std::min(N_BLOCK, cpu_n_w13 - n_block_begin);
-              const int n_in_block = local_n_start - n_block_begin;
-
-              for (int k_block_begin = 0; k_block_begin < cpu_k_w13; k_block_begin += K_BLOCK) {
-                const int k_block_size = std::min(K_BLOCK, cpu_k_w13 - k_block_begin);
-
-                for (int k_begin = 0; k_begin < k_block_size; k_begin += K_STEP) {
-                  const ggml_bf16_t* src = bb->b + (size_t)n_block_begin * cpu_k_w13 +
-                                           (size_t)k_block_begin * n_block_size + (size_t)n_in_block * k_block_size +
-                                           (size_t)k_begin * N_STEP;
-                  ggml_bf16_t* dst =
-                      weight_base + expert_weight_off + (size_t)n_in_gpu * gpu_k_w13 + k_block_begin + k_begin;
-                  unpack_nk_block_bf16(src, dst, gpu_k_w13);
-                }
-              }
+              const ggml_bf16_t* src = bb->b + (size_t)local_n * cpu_k_w13;
+              ggml_bf16_t* dst = weight_base + expert_weight_off + (size_t)n_in_gpu * gpu_k_w13;
+              fast_memcpy(dst, src, (size_t)cpu_k_w13 * sizeof(ggml_bf16_t));
             }
 
           } else {
-            // ========= W2 weight task: process chunk of rows x all K slices =========
             const int chunk_idx = task_id - NUM_W13_TASKS * 2;
             const auto& bb = down_bb_[expert_id];
+            const int row_start = chunk_idx * w2_rows_per_task;
+            const int row_end = std::min(row_start + w2_rows_per_task, cpu_n_w2);
 
-            const int step_start = chunk_idx * w2_steps_per_task;
-            const int step_end = std::min(step_start + w2_steps_per_task, w2_n_steps);
-            if (step_start >= w2_n_steps) return;
-            const int chunk_n_start = step_start * N_STEP;
-            const int chunk_n_end = std::min(step_end * N_STEP, cpu_n_w2);
-
-            for (int local_n_start = chunk_n_start; local_n_start < chunk_n_end; local_n_start += N_STEP) {
-              const int n_block_idx = local_n_start / N_BLOCK;
-              const int n_block_begin = n_block_idx * N_BLOCK;
-              const int n_block_size = std::min(N_BLOCK, cpu_n_w2 - n_block_begin);
-              const int n_in_block = local_n_start - n_block_begin;
-
-              for (int k_slice_start = 0; k_slice_start < cpu_k_w2; k_slice_start += gpu_k_w2) {
-                const int k_slice_end = std::min(k_slice_start + gpu_k_w2, cpu_k_w2);
-
-                const int global_k_start = global_k_offset_w2 + k_slice_start;
-                const int target_gpu = global_k_start / gpu_k_w2;
-                const int k_in_gpu_base = global_k_start % gpu_k_w2;
-
-                ggml_bf16_t* weight_base = (ggml_bf16_t*)w2_weight_ptrs[target_gpu];
-
-                for (int k_abs = k_slice_start; k_abs < k_slice_end; k_abs += K_STEP) {
-                  const int k_block_idx = k_abs / K_BLOCK;
-                  const int k_block_begin = k_block_idx * K_BLOCK;
-                  const int k_block_size = std::min(K_BLOCK, cpu_k_w2 - k_block_begin);
-                  const int k_in_block = k_abs - k_block_begin;
-                  const int k_in_gpu = k_in_gpu_base + (k_abs - k_slice_start);
-
-                  const ggml_bf16_t* src = bb->b + (size_t)n_block_begin * cpu_k_w2 +
-                                           (size_t)k_block_begin * n_block_size + (size_t)n_in_block * k_block_size +
-                                           (size_t)k_in_block * N_STEP;
-                  ggml_bf16_t* dst = weight_base + (size_t)local_n_start * gpu_k_w2 + k_in_gpu;
-                  unpack_nk_block_bf16(src, dst, gpu_k_w2);
-                }
+            for (int local_n = row_start; local_n < row_end; ++local_n) {
+              for (int local_k = 0; local_k < cpu_k_w2;) {
+                const int global_k = global_k_offset_w2 + local_k;
+                const int target_gpu = global_k / gpu_k_w2;
+                const int k_in_gpu = global_k % gpu_k_w2;
+                const int copy_elements = std::min(cpu_k_w2 - local_k, gpu_k_w2 - k_in_gpu);
+                const ggml_bf16_t* src = bb->b + (size_t)local_n * cpu_k_w2 + local_k;
+                ggml_bf16_t* dst = (ggml_bf16_t*)w2_weight_ptrs[target_gpu] +
+                                   (size_t)local_n * gpu_k_w2 + k_in_gpu;
+                fast_memcpy(dst, src, (size_t)copy_elements * sizeof(ggml_bf16_t));
+                local_k += copy_elements;
               }
             }
           }

@@ -26,6 +26,18 @@ max_len = 25600
 num_experts_per_tok = 8
 layer_num = 2
 
+
+class model_config:
+    def __init__(self, expert_num, hidden_size, intermediate_size, max_len, num_experts_per_tok, layer_num, model_name):
+        self.expert_num = expert_num
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.max_len = max_len
+        self.num_experts_per_tok = num_experts_per_tok
+        self.layer_num = layer_num
+        self.model_name = model_name
+
+
 qlen = 2048
 warm_up_iter = 1000
 test_iter = 2000
@@ -38,8 +50,8 @@ physical_to_logical_map = torch.tensor(data=range(expert_num), device="cpu", dty
 worker_config = kt_kernel_ext.WorkerPoolConfig()
 worker_config.subpool_count = 2
 worker_config.subpool_numa_map = [0, 1]
-worker_config.subpool_thread_count = [80, 80]
-CPUINFER_PARAM = 160
+worker_config.subpool_thread_count = [32, 32]
+CPUINFER_PARAM = 64
 CPUInfer = kt_kernel_ext.CPUInfer(worker_config)
 
 
@@ -140,7 +152,13 @@ def record_results(result, filename=json_path):
         f.write(json.dumps(result) + "\n")
 
 
-def bench_moe(quant_mode: str):
+def bench_moe(quant_mode: str, model_config: model_config, qlen: int = 2048):
+    expert_num = model_config.expert_num
+    hidden_size = model_config.hidden_size
+    intermediate_size = model_config.intermediate_size
+    max_len = model_config.max_len
+    num_experts_per_tok = model_config.num_experts_per_tok
+    layer_num = model_config.layer_num
     with torch.inference_mode():
         if quant_mode == "bf16":
             bytes_per_elem = 2.0
@@ -265,7 +283,9 @@ def bench_moe(quant_mode: str):
             hidden_size * intermediate_size * qlen * 3 * num_experts_per_tok * 2 * test_iter / total_time / 1e12
         )  # 单位：TFLOPS
 
+        print("Model Name: ", model_config.model_name)
         print("Quant mode: ", quant_mode)
+        print("Qlen: ", qlen)
         print("Time(s): ", total_time)
         print("Iteration: ", test_iter)
         print("Time(us) per iteration: ", time_per_iter_us)
@@ -304,7 +324,60 @@ def bench_moe(quant_mode: str):
 
 
 if __name__ == "__main__":
+    Mix8_7B = model_config(
+        expert_num=2,
+        hidden_size=4096,
+        intermediate_size=14336,
+        max_len=2048,
+        num_experts_per_tok=2,
+        layer_num=1,
+        model_name="Mixtral-8*7B",
+    )
+    Mix8_22B = model_config(
+        expert_num=2,
+        hidden_size=6144,
+        intermediate_size=16384,
+        max_len=2048,
+        num_experts_per_tok=2,
+        layer_num=1,
+        model_name="Mixtral-8*22B",
+    )
+    DS3 = model_config(
+        expert_num=64,
+        hidden_size=7186,
+        intermediate_size=2048,
+        max_len=2048,
+        num_experts_per_tok=8,
+        layer_num=1,
+        model_name="DeepSeek-V3",
+    )
+    Qwen3 = model_config(
+        expert_num=8,
+        hidden_size=4096,
+        intermediate_size=1536,
+        max_len=2048,
+        num_experts_per_tok=8,
+        layer_num=1,
+        model_name="Qwen3-30B-A3B",
+    )
+    Qwen2 = model_config(
+        expert_num=8,
+        hidden_size=3584,
+        intermediate_size=2560,
+        max_len=2048,
+        num_experts_per_tok=8,
+        layer_num=1,
+        model_name="Qwen2-57B-A14B",
+    )
+
     # 选择需要测试的量化模式
+    for i in range(2, 16):
+        # bench_moe("bf16", Mix8_7B, i)
+        # bench_moe("bf16", Mix8_22B, i)
+        # bench_moe("bf16", DS3, i)
+        bench_moe("bf16", Qwen2, i)
+        # bench_moe("bf16", Qwen3, i)
+        print("-" * 50)
     # bench_moe("bf16")
-    bench_moe("int8")
+    # bench_moe("int8")
     # bench_moe("int4")

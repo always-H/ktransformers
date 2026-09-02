@@ -591,9 +591,9 @@ class BF16SafeTensorLoader(SafeTensorLoader):
             up_w_key = f"{experts_prefix}.{exp_id}.{up_name}.weight"
             down_w_key = f"{experts_prefix}.{exp_id}.{down_name}.weight"
 
-            gate_weights[exp_id] = self.load_tensor(gate_w_key, device).contiguous()
-            up_weights[exp_id] = self.load_tensor(up_w_key, device).contiguous()
-            down_weights[exp_id] = self.load_tensor(down_w_key, device).contiguous()
+            gate_weights[exp_id] = self.load_tensor(gate_w_key, device).contiguous().pin_memory()
+            up_weights[exp_id] = self.load_tensor(up_w_key, device).contiguous().pin_memory()
+            down_weights[exp_id] = self.load_tensor(down_w_key, device).contiguous().pin_memory()
 
         return {
             "gate": gate_weights,

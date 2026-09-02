@@ -499,9 +499,11 @@ class NativeMoEWrapper(BaseMoEWrapper):
         self.cpu_infer.sync()
         t5 = time.time()
 
-        del self.gate_weights
-        del self.up_weights
-        del self.down_weights
+        if self.method != "BF16":
+            del self.gate_weights
+            del self.up_weights
+            del self.down_weights
+
         if self.gate_scales is not None:
             del self.gate_scales
             del self.up_scales

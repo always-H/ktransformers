@@ -398,9 +398,9 @@ echo "  CPUINFER_VERBOSE             = ${CPUINFER_VERBOSE:-1}"
 echo ""
 
 if [ ${CPUINFER_VERBOSE:-1} = "0" ]; then
-  python3 -m pip install .
+  python3 -m pip install -e . --no-build-isolation
 else
-  python3 -m pip install . -v
+  python3 -m pip install -e . -v --no-build-isolation
 fi
 }
 
@@ -416,13 +416,13 @@ fi
 
 case "$SUBCMD" in
   deps)
-    install_dependencies
+    # install_dependencies
     ;;
   build)
     build_step "$@"
     ;;
   all)
-    install_dependencies
+    # install_dependencies
     build_step "$@"
     ;;
 esac

@@ -120,7 +120,7 @@ class TP_MOE_Common : public MoE_Interface {
     }
 
     config.pool->dispense_backend()->do_numa_job(
-        [this, config](int i) { tps[i] = std::move(std::unique_ptr<T>(new T(tp_configs[i], i))); });
+        [this, config](int i) { tps[i] = std::move(std::unique_ptr<T>(new T(tp_configs[i], i))); }); // 真正初始化的地方
 
     local_output_numa.resize(tp_count, nullptr);
     MemoryRequest mem_requests;
@@ -162,11 +162,17 @@ class TP_MOE_Common : public MoE_Interface {
   void forward_binding(intptr_t qlen_ptr, int k, intptr_t expert_ids, intptr_t weights, intptr_t input, intptr_t output,
                        bool incremental) {
     forward((int*)qlen_ptr, k, (const int64_t*)expert_ids, (const float*)weights, (const void*)input, (void*)output,
-            incremental);
+            incremental, nullptr);
+  }
+
+  void forward_binding(intptr_t qlen_ptr, int k, intptr_t expert_ids, intptr_t weights, intptr_t input, intptr_t output,
+                       bool incremental, uintptr_t gpu_experts_mask_ptr) {
+    forward((int*)qlen_ptr, k, (const int64_t*)expert_ids, (const float*)weights, (const void*)input, (void*)output,
+            incremental, reinterpret_cast<uint8_t*>(gpu_experts_mask_ptr));
   }
 
   void forward(int* qlen_ptr, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output,
-               bool incremental) {
+               bool incremental, uint8_t* override_mask = nullptr) {
     if (weights_loaded == false) [[unlikely]] {
       throw std::runtime_error("Not Loaded");
     }
@@ -175,12 +181,31 @@ class TP_MOE_Common : public MoE_Interface {
 #endif
     int qlen = *qlen_ptr;
 
+    uint8_t* saved_mask = config.gpu_experts_mask;
+    if (override_mask) config.gpu_experts_mask = override_mask;
+
     auto pool = config.pool;
-    pool->dispense_backend()->do_numa_job([this, pool, qlen, k, expert_ids, input, weights](int numa_id) {
-      tps[numa_id]->forward(qlen, k, expert_ids, weights, input, this->local_output_numa[numa_id]);
-    });
+    pool->dispense_backend()->do_numa_job(
+        [this, pool, qlen, k, expert_ids, input, weights, override_mask](int numa_id) {
+          uint8_t* saved_part_mask = nullptr;
+          if constexpr (requires(T& part, uint8_t* mask) {
+                          { part.swap_gpu_experts_mask(mask) } -> std::same_as<uint8_t*>;
+                        }) {
+            if (override_mask) saved_part_mask = tps[numa_id]->swap_gpu_experts_mask(override_mask);
+          }
+
+          tps[numa_id]->forward(qlen, k, expert_ids, weights, input, this->local_output_numa[numa_id]);
+
+          if constexpr (requires(T& part, uint8_t* mask) {
+                          { part.swap_gpu_experts_mask(mask) } -> std::same_as<uint8_t*>;
+                        }) {
+            if (override_mask) tps[numa_id]->swap_gpu_experts_mask(saved_part_mask);
+          }
+        });
 
     merge_results(qlen, output, incremental);
+
+    if (override_mask) config.gpu_experts_mask = saved_mask;
 #ifdef FORWARD_TIME_REPORT
     auto end = std::chrono::high_resolution_clock::now();
     auto forward_time = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();

@@ -404,6 +404,212 @@ class BaseMoEWrapper(ABC):
         output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
         return output_gpu[current_slot]
 
+    def submit_forward_with_slot(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        cuda_stream,
+        slot: int,
+        override_mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        Submit forward inference with explicit buffer slot selection.
+
+        Like submit_forward but uses the provided slot instead of layer_idx-based
+        auto-selection. This allows two-phase submission (e.g., early + late CPU
+        expert computation) without buffer collision.
+
+        Args:
+            hidden_states: Input hidden states [batch_size, hidden_size]
+            topk_ids: Top-k expert IDs [batch_size, num_experts_per_tok]
+            topk_weights: Top-k expert weights [batch_size, num_experts_per_tok]
+            cuda_stream: CUDA stream for synchronization
+            slot: Explicit buffer slot index (0 or 1)
+        """
+        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+
+        (
+            input_tensor_cpu,
+            immediate_experts_ids_cpu,
+            deferred_experts_ids_cpu,
+            weights_cpu,
+            output_cpu,
+            bsz_tensor_cpu,
+            _output_gpu,
+        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
+
+        bsz_slot_tensor = bsz_tensor_cpu[slot]
+
+        topk_ids_long = topk_ids.to(torch.long)
+        immediate_ids: torch.Tensor
+        deferred_ids: Optional[torch.Tensor]
+        if self.max_deferred_experts_per_token > 0:
+            protected_k = self.num_experts_per_tok - self.max_deferred_experts_per_token
+            immediate_ids, deferred_ids = self.select_deferred_experts(topk_ids_long, topk_weights, protected_k)
+        else:
+            immediate_ids = topk_ids_long
+            deferred_ids = None
+
+        input_tensor_cpu[slot].copy_(flat_hidden_states, non_blocking=True)
+        weights_cpu[slot].copy_(topk_weights, non_blocking=True)
+        immediate_experts_ids_cpu[slot].copy_(immediate_ids, non_blocking=True)
+
+        incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+        forward_args = [
+            bsz_slot_tensor.data_ptr(),
+            immediate_experts_ids_cpu[slot].size(-1),
+            immediate_experts_ids_cpu[slot].data_ptr(),
+            weights_cpu[slot].data_ptr(),
+            input_tensor_cpu[slot].data_ptr(),
+            output_cpu[slot].data_ptr(),
+            incremental,
+        ]
+        if override_mask is not None:
+            forward_args.append(override_mask.data_ptr())
+        self.cpu_infer.submit_with_cuda_stream(
+            cuda_stream,
+            self.moe.forward_task(*forward_args),
+        )
+
+        BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
+        if deferred_ids is not None:
+            deferred_experts_ids_cpu[slot].copy_(deferred_ids, non_blocking=True)
+            next_slot = (slot + 1) % KExpertsCPUBuffer.buffer_depth
+            deferred_args = [
+                bsz_slot_tensor.data_ptr(),
+                deferred_experts_ids_cpu[slot].size(-1),
+                deferred_experts_ids_cpu[slot].data_ptr(),
+                weights_cpu[slot].data_ptr(),
+                input_tensor_cpu[slot].data_ptr(),
+                output_cpu[next_slot].data_ptr(),
+                False,
+            ]
+            if override_mask is not None:
+                deferred_args.append(override_mask.data_ptr())
+            self.cpu_infer.submit_with_cuda_stream(
+                cuda_stream,
+                self.moe.forward_task(*deferred_args),
+            )
+            BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
+
+    def sync_forward_with_slot(self, hidden_states: torch.Tensor, cuda_stream, slot: int) -> torch.Tensor:
+        """
+        Synchronize and retrieve results for a specific buffer slot.
+
+        Like sync_forward but uses the provided slot instead of layer_idx-based
+        auto-selection.
+
+        Args:
+            hidden_states: Original input hidden states (for getting buffer)
+            cuda_stream: CUDA stream for synchronization
+            slot: Explicit buffer slot index (0 or 1)
+
+        Returns:
+            output_gpu: Output tensor on GPU for the specified slot
+        """
+        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        (
+            _input_tensor_cpu,
+            _immediate_experts_ids_cpu,
+            _deferred_experts_ids_cpu,
+            _weights_cpu,
+            output_cpu,
+            _bsz_tensor_cpu,
+            output_gpu,
+        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
+
+        allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
+        self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
+        output_gpu[slot].copy_(output_cpu[slot], non_blocking=True)
+        return output_gpu[slot]
+
+    def submit_forward_with_mask(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        cuda_stream,
+        override_mask: torch.Tensor,
+    ):
+        """
+        Submit forward with an explicit override GPU experts mask.
+
+        Unlike submit_forward which reads the mask from moe->config at execution
+        time, this method captures the override_mask pointer as a task argument.
+        The C++ worker uses this captured pointer instead of config.gpu_experts_mask,
+        avoiding races when the Python thread changes the mask between phases.
+
+        Args:
+            hidden_states: Input hidden states [batch_size, hidden_size]
+            topk_ids: Top-k expert IDs [batch_size, num_experts_per_tok]
+            topk_weights: Top-k expert weights [batch_size, num_experts_per_tok]
+            cuda_stream: CUDA stream for synchronization
+            override_mask: Pinned CPU bool tensor [num_experts], captured by value.
+                           True = GPU expert (skip), False = CPU expert (compute).
+        """
+        flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        batch_size = flat_hidden_states.shape[0]
+
+        (
+            input_tensor_cpu,
+            immediate_experts_ids_cpu,
+            deferred_experts_ids_cpu,
+            weights_cpu,
+            output_cpu,
+            bsz_tensor_cpu,
+            _output_gpu,
+        ) = KExpertsCPUBuffer.get_buffer(flat_hidden_states, self.num_experts_per_tok)
+
+        current_slot = self.layer_idx % KExpertsCPUBuffer.buffer_depth
+
+        bsz_slot_tensor = bsz_tensor_cpu[current_slot]
+        topk_ids_long = topk_ids.to(torch.long)
+        immediate_ids = topk_ids_long
+        deferred_ids: Optional[torch.Tensor] = None
+
+        if self.max_deferred_experts_per_token > 0:
+            protected_k = self.num_experts_per_tok - self.max_deferred_experts_per_token
+            immediate_ids, deferred_ids = self.select_deferred_experts(topk_ids_long, topk_weights, protected_k)
+
+        input_tensor_cpu[current_slot].copy_(flat_hidden_states, non_blocking=True)
+        weights_cpu[current_slot].copy_(topk_weights, non_blocking=True)
+        immediate_experts_ids_cpu[current_slot].copy_(immediate_ids, non_blocking=True)
+
+        incremental = BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx - 1, False)
+        self.cpu_infer.submit_with_cuda_stream(
+            cuda_stream,
+            self.moe.forward_task(
+                bsz_slot_tensor.data_ptr(),
+                immediate_experts_ids_cpu[current_slot].size(-1),
+                immediate_experts_ids_cpu[current_slot].data_ptr(),
+                weights_cpu[current_slot].data_ptr(),
+                input_tensor_cpu[current_slot].data_ptr(),
+                output_cpu[current_slot].data_ptr(),
+                incremental,
+                override_mask.data_ptr(),  # captured by value in the lambda
+            ),
+        )
+
+        BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = False
+        if deferred_ids is not None:
+            deferred_experts_ids_cpu[current_slot].copy_(deferred_ids, non_blocking=True)
+            next_slot = (current_slot + 1) % KExpertsCPUBuffer.buffer_depth
+            self.cpu_infer.submit_with_cuda_stream(
+                cuda_stream,
+                self.moe.forward_task(
+                    bsz_slot_tensor.data_ptr(),
+                    deferred_experts_ids_cpu[current_slot].size(-1),
+                    deferred_experts_ids_cpu[current_slot].data_ptr(),
+                    weights_cpu[current_slot].data_ptr(),
+                    input_tensor_cpu[current_slot].data_ptr(),
+                    output_cpu[next_slot].data_ptr(),
+                    False,
+                    override_mask.data_ptr(),
+                ),
+            )
+            BaseMoEWrapper._layer_has_pending_deferred[self.layer_idx] = True
+
     def forward(
         self,
         hidden_states: torch.Tensor,

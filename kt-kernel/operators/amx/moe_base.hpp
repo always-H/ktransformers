@@ -12,7 +12,6 @@
 
 // #define FORWARD_TIME_PROFILE
 
-#include <immintrin.h>
 
 #include <algorithm>
 #include <chrono>
@@ -34,6 +33,12 @@
 #include "../moe-tp.hpp"
 #include "la/amx.hpp"
 #include "llama.cpp/ggml.h"
+#include "gather.hpp"
+#include "Kernel.hpp"
+
+
+
+//------------------------------------------------------------
 
 template <class T, class Derived>
 class AMX_MOE_BASE {
@@ -62,6 +67,10 @@ class AMX_MOE_BASE {
   std::vector<std::shared_ptr<typename T::BufferB>> down_bb_;
   std::vector<std::shared_ptr<typename T::BufferC>> down_bc_;
 
+
+//--------------------------------------------------------------
+  int E =0;
+//--------------------------------------------------------------
   size_t pool_count_ = 0;
   size_t gate_up_ba_pool_bytes_ = 0;
   size_t gate_bc_pool_bytes_ = 0;
@@ -84,20 +93,34 @@ class AMX_MOE_BASE {
     derived()->derived_init();
   }
 
+  uint8_t* swap_gpu_experts_mask(uint8_t* mask) {
+    uint8_t* previous = config_.gpu_experts_mask;
+    config_.gpu_experts_mask = mask;
+    return previous;
+  }
+
   void init() {
+
+    //通知OS
+    syscall(SYS_arch_prctl, 0x1023, 18);
+
+//--------------------------------------------------------------
+    E = config_.expert_num;
+//--------------------------------------------------------------
+
     if (config_.load && config_.path == "") {
       config_.load = false;
     }
 
     MemoryRequest mem_requests;
-    mem_requests.append_pointer(
-        &m_local_input_, sizeof(ggml_bf16_t) * config_.num_experts_per_tok * config_.max_len * config_.hidden_size);
-    mem_requests.append_pointer(&m_local_gate_output_, sizeof(ggml_bf16_t) * config_.num_experts_per_tok *
-                                                           config_.max_len * config_.intermediate_size);
-    mem_requests.append_pointer(&m_local_up_output_, sizeof(ggml_bf16_t) * config_.num_experts_per_tok *
-                                                         config_.max_len * config_.intermediate_size);
-    mem_requests.append_pointer(&m_local_down_output_, sizeof(ggml_bf16_t) * config_.num_experts_per_tok *
-                                                           config_.max_len * config_.hidden_size);
+    const size_t ml = config_.max_len;
+    const size_t k_tok = config_.num_experts_per_tok;
+    const size_t H = config_.hidden_size;
+    const size_t I = config_.intermediate_size;
+    mem_requests.append_pointer(&m_local_input_, sizeof(ggml_bf16_t) * k_tok * ml * H);
+    mem_requests.append_pointer(&m_local_gate_output_, sizeof(ggml_bf16_t) * k_tok * ml * I);
+    mem_requests.append_pointer(&m_local_up_output_, sizeof(ggml_bf16_t) * k_tok * ml * I);
+    mem_requests.append_pointer(&m_local_down_output_, sizeof(ggml_bf16_t) * k_tok * ml * H);
 
     m_local_pos_.resize(config_.max_len);
     for (int i = 0; i < config_.max_len; i++) {
@@ -130,7 +153,7 @@ class AMX_MOE_BASE {
     }
     // TODO: need update to all *.hpp
     // (config_.expert_num * T::M_STEP) in pool_count_ is to ensure padding for each experts.
-    pool_count_ = config_.max_len * config_.num_experts_per_tok + config_.expert_num * T::M_STEP;
+    pool_count_ = (size_t)config_.max_len * config_.num_experts_per_tok + config_.expert_num * T::M_STEP;
 
     gate_up_ba_pool_bytes_ = buffer_a_required_size(pool_count_, config_.hidden_size) + pool_count_ * 64;
     gate_bc_pool_bytes_ = buffer_c_required_size(pool_count_, config_.intermediate_size) + pool_count_ * 64;
@@ -145,6 +168,7 @@ class AMX_MOE_BASE {
     mem_requests.append_pointer(&down_bc_pool_, down_bc_pool_bytes_);
 
     shared_mem_buffer_numa.alloc(tp_part_idx, this, mem_requests);
+
   }
 
   ~AMX_MOE_BASE() = default;
@@ -170,6 +194,19 @@ class AMX_MOE_BASE {
     }
   }
 
+  // The AMX gate/up kernels always write a 32-column tile.  Keep every
+  // parallel shard 32-column aligned so a short tail cannot overwrite the
+  // next shard.  DeepSeek-V2-Lite has 1408 intermediate columns, so its
+  // gate/up path uses four shards (352 columns each) instead of eight.
+  static int choose_aligned_nth(int requested_nth, long output_size) {
+    int nth = requested_nth;
+    while (nth > 1 && output_size % (nth * 32L) != 0) {
+      nth /= 2;
+    }
+    assert(output_size % (nth * 32L) == 0);
+    return nth;
+  }
+
   template <typename... Args>
   void load_weights(Args&&... args) {
     derived()->load_weights(std::forward<Args>(args)...);
@@ -190,6 +227,28 @@ class AMX_MOE_BASE {
     long act_time = 0, q_down_time = 0, down_time = 0, weight_time = 0;
     int max_local_num = 0;
 #endif
+
+
+
+//修改
+//-------------------------------------------------------------------
+    //std::vector<long> act_expert_id;
+    //act_expert_id.reserve(E);
+    std::vector<std::vector<uint32_t>> expert_idx(E);
+
+    for (int t = 0; t < qlen; ++t) {
+      uint32_t base = t * config_.hidden_size * sizeof(ggml_bf16_t);
+      for (int i = 0; i < k; ++i) {
+        const int64_t expert_id = expert_ids[t * k + i];
+        if (config_.should_skip_expert(expert_id)) {
+          continue;
+        }
+        expert_idx[expert_id].push_back(base);
+      }
+    }
+
+//------------------------------------------------------------------
+
 
     int activated_expert = 0;
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
@@ -294,6 +353,7 @@ class AMX_MOE_BASE {
       }
     };
 
+//--------------------------------------------------------------------
     direct_or_pool(qlen, [&](int i) {
       for (int j = 0; j < k; j++) {
         if (config_.should_skip_expert(expert_ids[i * k + j])) {
@@ -303,6 +363,58 @@ class AMX_MOE_BASE {
                (ggml_bf16_t*)input + i * config_.hidden_size, sizeof(ggml_bf16_t) * config_.hidden_size);
       }
     });
+//--------------------------------------------------------------------
+
+
+  constexpr int kTaskTokenBlockSize = 128;   // 任务粒度：每个任务最多处理 128 个 token
+  constexpr int kGatherBlockSize = 16;       // Gather_expert_tokens 每次最多处理 16 个 token
+
+  std::vector<ExpertBlockTask> tasks;
+
+  for (int i = 0; i < activated_expert; ++i) {
+      const int expert_id = m_expert_id_map_[i];
+      const int m_tokens = expert_idx[expert_id].size();
+
+      for (int j = 0; j < m_tokens; j += kTaskTokenBlockSize) {
+          ExpertBlockTask t;
+          t.expert_id = expert_id;
+          t.block_start = j;
+          t.block_tokens = std::min(kTaskTokenBlockSize, m_tokens - j);
+          tasks.push_back(t);
+      }
+  }
+
+  // 任务总数 = sum_i ceil(tokens_i / 128)
+  direct_or_pool(tasks.size(), [&](int task_id) {
+      const ExpertBlockTask &t = tasks[task_id];
+
+      uint32_t *base_idx_ptr = expert_idx[t.expert_id].data() + t.block_start;
+      uint16_t *base_output_ptr = (uint16_t*)m_local_input_ptr_[t.expert_id]
+                                  + t.block_start * config_.hidden_size;
+
+      // 在任务内部，仍按 16 切分，调用 Gather_expert_tokens
+      for (int j = 0; j < t.block_tokens; j += kGatherBlockSize) {
+          const int mr = std::min(kGatherBlockSize, t.block_tokens - j);
+          Gather_expert_tokens(
+              base_output_ptr + j * config_.hidden_size,
+              (uint16_t*)input,
+              config_.hidden_size,
+              mr,
+              base_idx_ptr + j
+          );
+      }
+  });
+
+//检查布局转换后的结果
+    /*
+    for(int ii = 0; ii < activated_expert; ii++)
+    {
+        Check_Transpose((uint16_t*)input, expert_idx[m_expert_id_map_[ii]].data(),
+                        (uint16_t*)m_local_input_ptr_[m_expert_id_map_[ii]],
+                        expert_idx[m_expert_id_map_[ii]].size(), config_.hidden_size);
+    }*/
+
+
 
 #ifdef FORWARD_TIME_PROFILE
     {
@@ -311,12 +423,14 @@ class AMX_MOE_BASE {
       last = now_time;
     }
 #endif
-
+    /*
+//--------------------------------------------------------------------
     direct_or_pool(activated_expert, [this](int task_id) {
       int expert_idx = m_expert_id_map_[task_id];
       gate_up_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_input_ptr_[expert_idx], 0, 1);
     });
-
+//--------------------------------------------------------------------
+*/
 #ifdef FORWARD_TIME_PROFILE
     {
       auto now_time = std::chrono::high_resolution_clock::now();
@@ -325,6 +439,8 @@ class AMX_MOE_BASE {
     }
 #endif
 
+/*
+//--------------------------------------------------------------------
     int nth = T::recommended_nth(config_.intermediate_size);
     pool->do_work_stealing_job(
         nth * activated_expert * 2, [](int _) { T::config(); },
@@ -335,6 +451,7 @@ class AMX_MOE_BASE {
 
           int ith = task_id % nth;
           derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
+
           if (do_up) {
             up_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_up_output_ptr_[expert_idx], ith, nth);
           } else {
@@ -342,6 +459,97 @@ class AMX_MOE_BASE {
           }
         },
         nullptr);
+
+//--------------------------------------------------------------------
+*/
+
+//------------------------------------------------------------------
+    struct PrefillGemmTask {
+      int expert_idx;
+      long m_offset;
+      long m_count;
+      long n_offset;
+      long n_count;
+      long work_units;
+    };
+
+    auto make_prefill_gemm_tasks = [&](long output_size) {
+      constexpr long kTargetTokensPerNShard = 32;
+      constexpr int kMaxNShardsPerExpert = 32;
+      constexpr long kTargetTokensPerMShard = 1024;
+      constexpr int kMaxMShardsPerExpert = 2;
+      std::vector<PrefillGemmTask> tasks;
+      tasks.reserve(activated_expert * 2);
+
+      for (int i = 0; i < activated_expert; ++i) {
+        const int expert_idx = m_expert_id_map_[i];
+        const long m_tokens = m_local_num_[expert_idx];
+        int expert_nth = T::recommended_nth(output_size);
+        if (m_tokens >= 256) {
+          expert_nth = 2;
+          while (expert_nth < kMaxNShardsPerExpert &&
+                 (m_tokens + expert_nth - 1) / expert_nth > kTargetTokensPerNShard) {
+            expert_nth *= 2;
+          }
+        }
+        while (expert_nth > 1 && output_size % (expert_nth * 32L) != 0) {
+          --expert_nth;
+        }
+        assert(output_size % (expert_nth * 32L) == 0);
+        const long n_count = output_size / expert_nth;
+        const int m_shards = std::min<int>(
+            kMaxMShardsPerExpert, (m_tokens + kTargetTokensPerMShard - 1) / kTargetTokensPerMShard);
+        const long m_block_size =
+            ((m_tokens + m_shards - 1) / m_shards + T::M_STEP - 1) / T::M_STEP * T::M_STEP;
+        for (int ith = 0; ith < expert_nth; ++ith) {
+          for (long m_offset = 0; m_offset < m_tokens; m_offset += m_block_size) {
+            const long m_count = std::min(m_block_size, m_tokens - m_offset);
+            tasks.push_back({expert_idx, m_offset, m_count, ith * n_count, n_count, m_count * n_count});
+          }
+        }
+
+      }
+
+
+
+      std::stable_sort(tasks.begin(), tasks.end(), [](const PrefillGemmTask& lhs, const PrefillGemmTask& rhs) {
+        return lhs.work_units > rhs.work_units;
+      });
+      return tasks;
+    };
+
+    auto gate_up_tasks = make_prefill_gemm_tasks(config_.intermediate_size);
+     //printf("+++++++++++++ %d\n", gate_up_tasks.size());
+
+
+    pool->do_work_stealing_job(
+        gate_up_tasks.size(), nullptr,
+        [&](int task_id){
+            const auto& task = gate_up_tasks[task_id];
+            int expert_idx = task.expert_idx;
+            long M_total = m_local_num_[expert_idx];
+            long M = task.m_count;
+            long N = config_.intermediate_size;
+            long K = config_.hidden_size;
+
+
+            bf16gemm_gate_up_kernel(
+                            (uint16_t*)m_local_gate_output_ptr_[expert_idx] + task.m_offset*N,
+                            (uint16_t*)m_local_up_output_ptr_[expert_idx] + task.m_offset*N,
+                            (float*)(*gate_bc_[expert_idx]).c + task.n_offset*M_total + task.m_offset*task.n_count,
+                            //(float*)(*up_bc_[expert_idx]).c + ith*N_blk*M,
+                            (uint16_t*)m_local_input_ptr_[expert_idx] + task.m_offset*K,
+                            (uint16_t*)(*gate_bb_[expert_idx]).b + task.n_offset*K,
+                            (uint16_t*)(*up_bb_[expert_idx]).b + task.n_offset*K,
+                            M, task.n_count, K, N, task.n_offset);
+
+
+            //_tile_release ();
+        },
+        nullptr);
+
+    int nth = T::recommended_nth(config_.intermediate_size);
+//------------------------------------------------------------------
 
 #ifdef FORWARD_TIME_PROFILE
     {
@@ -361,6 +569,9 @@ class AMX_MOE_BASE {
     }
 #endif
 
+/*
+//没必须对数据做布局转换
+//--------------------------------------------------------------------
     pool->do_work_stealing_job(
         activated_expert, nullptr,
         [this](int task_id) {
@@ -368,6 +579,8 @@ class AMX_MOE_BASE {
           down_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_gate_output_ptr_[expert_idx], 0, 1);
         },
         nullptr);
+//--------------------------------------------------------------------
+*/
 
 #ifdef FORWARD_TIME_PROFILE
     {
@@ -376,7 +589,8 @@ class AMX_MOE_BASE {
       last = now_time;
     }
 #endif
-
+/*
+//--------------------------------------------------------------------
     nth = T::recommended_nth(config_.hidden_size);
     pool->do_work_stealing_job(
         nth * activated_expert, [](int _) { T::config(); },
@@ -387,6 +601,34 @@ class AMX_MOE_BASE {
           down_bc_[expert_idx]->to_mat(m_local_num_[expert_idx], m_local_down_output_ptr_[expert_idx], ith, nth);
         },
         nullptr);
+//--------------------------------------------------------------------
+*/
+//------------------------------------------------------------------
+    //printf("config_.hidden_size = %d\n", config_.hidden_size);
+
+    auto down_tasks = make_prefill_gemm_tasks(config_.hidden_size);
+    pool->do_work_stealing_job(
+        down_tasks.size(), nullptr,
+        [&](int task_id){
+            const auto& task = down_tasks[task_id];
+            int expert_idx = task.expert_idx;
+            long M_total = m_local_num_[expert_idx];
+            long M = task.m_count;
+            long N = config_.hidden_size;
+            long K = config_.intermediate_size;
+
+            bf16gemm_down_kernel((uint16_t*)m_local_down_output_ptr_[expert_idx] + task.m_offset*N + task.n_offset,
+                            (float*)(*down_bc_[expert_idx]).c + task.n_offset*M_total + task.m_offset*task.n_count,
+                              (uint16_t*)m_local_gate_output_ptr_[expert_idx] + task.m_offset*K,
+                            (uint16_t*)(*down_bb_[expert_idx]).b + task.n_offset*K,
+                            M, task.n_count, K, N);
+            _tile_release();
+        },
+        nullptr);
+
+    nth = T::recommended_nth(config_.intermediate_size);
+//------------------------------------------------------------------
+
 
 #ifdef FORWARD_TIME_PROFILE
     {
@@ -513,17 +755,6 @@ class AMX_MOE_BASE {
     assert(used_pool_bytes_ba_down <= down_ba_pool_bytes_);
     assert(used_pool_bytes_bc_down <= down_bc_pool_bytes_);
 
-    void* gate_up_ba_pool_ptr = gate_up_ba_pool_;
-    for (int i = 0; i < activated_expert; i++) {
-      auto expert_idx = m_expert_id_map_[i];
-      size_t max_m = (qlen + M_STEP - 1) / M_STEP * M_STEP;
-      gate_up_ba_[expert_idx]->max_m = max_m;
-      gate_up_ba_[expert_idx]->set_data(gate_up_ba_pool_ptr);
-      size_t ba_size = align64(buffer_a_required_size(max_m, config_.hidden_size));
-      gate_up_ba_pool_ptr = (void*)((uintptr_t)gate_up_ba_pool_ptr + ba_size);
-      gate_up_ba_[expert_idx]->from_mat(qlen, (ggml_bf16_t*)input, 0, 1);
-    }
-
 #ifdef FORWARD_TIME_PROFILE
     {
       auto now_time = std::chrono::high_resolution_clock::now();
@@ -531,7 +762,7 @@ class AMX_MOE_BASE {
       last = now_time;
     }
 #endif
-
+/*
     int nth = T::recommended_nth(config_.intermediate_size);
     pool->do_work_stealing_job(
         nth * activated_expert * 2, [](int _) { T::config(); },
@@ -549,6 +780,39 @@ class AMX_MOE_BASE {
           }
         },
         nullptr);
+*/
+
+
+    int nth = 2;
+    if(activated_expert<=8)
+      nth = 8;
+    nth = choose_aligned_nth(nth, config_.intermediate_size);
+    long N_blk = config_.intermediate_size/nth;
+    pool->do_work_stealing_job(
+        nth * activated_expert, nullptr,
+        [&](int task_id){
+            int expert_idx = m_expert_id_map_[task_id / nth];
+            int ith = task_id % nth;
+            long M = m_local_num_[expert_idx];
+            long N = config_.intermediate_size;
+            long K = config_.hidden_size;
+
+
+            bf16gemm_gate_up_kernel(
+                            (uint16_t*)m_local_gate_output_ptr_[expert_idx],
+                            (uint16_t*)m_local_up_output_ptr_[expert_idx],
+                            (float*)(*gate_bc_[expert_idx]).c + ith*N_blk*M,
+                            //(float*)(*up_bc_[expert_idx]).c + ith*N_blk*M,
+                            (uint16_t*)input,
+                            (uint16_t*)(*gate_bb_[expert_idx]).b + ith*N_blk*K,
+                            (uint16_t*)(*up_bb_[expert_idx]).b + ith*N_blk*K,
+                            M, N_blk, K, N /*stride_N*/, ith*N_blk /*n_offset*/);
+
+
+        },
+        nullptr);
+
+    nth = T::recommended_nth(config_.intermediate_size);
 
 #ifdef FORWARD_TIME_PROFILE
     {
@@ -567,7 +831,7 @@ class AMX_MOE_BASE {
       last = now_time;
     }
 #endif
-
+/*
     pool->do_work_stealing_job(
         activated_expert, nullptr,
         [this, qlen](int task_id) {
@@ -575,7 +839,7 @@ class AMX_MOE_BASE {
           down_ba_[expert_idx]->from_mat(qlen, m_local_gate_output_ptr_[expert_idx], 0, 1);
         },
         nullptr);
-
+*/
 #ifdef FORWARD_TIME_PROFILE
     {
       auto now_time = std::chrono::high_resolution_clock::now();
@@ -584,6 +848,7 @@ class AMX_MOE_BASE {
     }
 #endif
 
+/*
     nth = T::recommended_nth(config_.hidden_size);
     pool->do_work_stealing_job(
         nth * activated_expert, [](int _) { T::config(); },
@@ -594,6 +859,35 @@ class AMX_MOE_BASE {
           down_bc_[expert_idx]->to_mat(qlen, m_local_down_output_ptr_[expert_idx], ith, nth);
         },
         nullptr);
+*/
+
+
+    nth = 2;
+    if(activated_expert<=8)
+      nth = 8;
+    nth = choose_aligned_nth(nth, config_.hidden_size);
+    N_blk = config_.hidden_size/nth;
+    pool->do_work_stealing_job(
+        nth * activated_expert, nullptr,
+        [&](int task_id){
+            int expert_idx = m_expert_id_map_[task_id / nth];
+
+            int ith = task_id % nth;
+            long M = m_local_num_[expert_idx];
+            long N = config_.hidden_size;
+            long K = config_.intermediate_size;
+
+            bf16gemm_down_kernel((uint16_t*)m_local_down_output_ptr_[expert_idx] + ith*N_blk,
+                            (float*)(*down_bc_[expert_idx]).c + ith*N_blk*M,
+                              (uint16_t*)m_local_gate_output_ptr_[expert_idx],
+                            (uint16_t*)(*down_bb_[expert_idx]).b + ith*N_blk*K,
+                            M, N_blk, K, N /*stride_N*/);
+            _tile_release ();
+        },
+        nullptr);
+
+  nth = T::recommended_nth(config_.intermediate_size);
+//------------------------------------------------------------------
 
 #ifdef FORWARD_TIME_PROFILE
     {
@@ -704,6 +998,8 @@ class AMX_MOE_BASE {
       pool->do_work_stealing_job(nth * activated_expert, nullptr, fn, nullptr);
     }
   }
+
+
 };
 
 // ============================================================================
@@ -771,6 +1067,8 @@ class TP_MOE<AMX_MOE_BASE<T, Derived>> : public TP_MOE_Common<AMX_MOE_BASE<T, De
   }
 
   void merge_results(int qlen, void* output) override { merge_results(qlen, output, false); }
+
+
 };
 
 #endif  // CPUINFER_OPERATOR_AMX_MOE_BASE_H

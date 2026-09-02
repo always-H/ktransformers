@@ -71,24 +71,37 @@ InNumaPool::InNumaPool(int max_thread_num, int numa_id, int threads_id_start) {
       // printf("Failed to set thread name: %s\n", name);
     }
     // Set the thread affinity to the specified NUMA node's CPU
-    numa_obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, numa_id);
-    if (!numa_obj) {
-      fprintf(stderr, "NUMA node %d not found\n", numa_id);
-      // throw std::runtime_error("NUMA node not found");
-      continue;
+    if (numa_id == -1) {
+      // 绑定到 64-126（i=1→CPU64, i=2→CPU65, ..., i=63→CPU126）
+      cpuset = hwloc_bitmap_alloc();
+      hwloc_bitmap_set(cpuset, 63 + i);  // 关键：63 + i 精确映射到64-126
+      int res = hwloc_set_thread_cpubind(topology, native_handle, cpuset, HWLOC_CPUBIND_STRICT);
+      if (res != 0) {
+        fprintf(stderr, "Failed to bind thread %d to CPU %d: %s\n", i, 63+i, strerror(errno));
+      }
+      hwloc_bitmap_free(cpuset);
     }
-    core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, i + threads_id_start);
-    if (!core_obj) {
-      fprintf(stderr, "Core %d inside NUMA node %d not found\n", i, numa_id);
-      // throw std::runtime_error("Core not found inside NUMA node");
-      continue;
-    }
-    cpuset = hwloc_bitmap_alloc();
-    hwloc_bitmap_copy(cpuset, core_obj->cpuset);
-    hwloc_bitmap_singlify(cpuset);
-    auto res = hwloc_set_thread_cpubind(topology, native_handle, cpuset, HWLOC_CPUBIND_STRICT);
-    if (res != 0) {
-      fprintf(stderr, "Failed to set thread CPU binding: %s\n", strerror(errno));
+    else {
+      numa_obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, numa_id);
+      if (!numa_obj) {
+        fprintf(stderr, "NUMA node %d not found\n", numa_id);
+        // throw std::runtime_error("NUMA node not found");
+        continue;
+      }
+      core_obj = hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, i + threads_id_start);
+      if (!core_obj) {
+        fprintf(stderr, "Core %d inside NUMA node %d not found\n", i, numa_id);
+        // throw std::runtime_error("Core not found inside NUMA node");
+        continue;
+      }
+      cpuset = hwloc_bitmap_alloc();
+      hwloc_bitmap_copy(cpuset, core_obj->cpuset);
+      hwloc_bitmap_singlify(cpuset);
+      auto res = hwloc_set_thread_cpubind(topology, native_handle, cpuset, HWLOC_CPUBIND_STRICT);
+      if (res != 0) {
+        fprintf(stderr, "Failed to set thread CPU binding: %s\n", strerror(errno));
+      }
+      hwloc_bitmap_free(cpuset);
     }
   }
 }
