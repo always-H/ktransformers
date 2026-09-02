@@ -1,3 +1,54 @@
+# LayerScopeV2
+
+This `master` branch contains the implementation artifact for **LayerScopeV2: Predictive Cross-Layer Scheduling with AMX Acceleration for Memory-Bound MoE Inference**.
+
+LayerScopeV2 integrates LayerScope's predictive cross-layer scheduling into KTransformers+SGLang (KT+SGL) and co-designs scheduling with accelerated AMX expert execution.
+
+## What LayerScopeV2 Adds
+
+- **Checkpoint-native BF16 AMX execution.** Hand-written AVX-512 gather and AMX GEMM assembly consume row-major checkpoint weights directly, avoiding runtime weight repacking and persistent duplicate layouts.
+- **AMX-aware cost gating.** An aggregate CPU latency model enables dynamic expert placement and cross-layer prefetching only when their predicted benefit exceeds computation, transfer, and scheduling costs.
+- **Scheduler Overlap.** Experts committed to CPU execution start before the remaining placement decisions finish, hiding most scheduler latency behind useful CPU work.
+
+On an NVIDIA RTX A6000 and an Intel Xeon Gold 6430, LayerScopeV2 reduces prefill time to first token by 13.4%-48.0% and reaches up to 2.16x the decoding throughput of KT+SGL across four MoE models.
+
+## Artifact Layout
+
+| Component | Location |
+| --- | --- |
+| Native row-major BF16 AMX kernels | [`kt-kernel/operators/amx/`](./kt-kernel/operators/amx/) |
+| Cost-aware scheduling and expert dispatch | [`kt-kernel/python/experts_base.py`](./kt-kernel/python/experts_base.py), [`kt-kernel/operators/moe-tp.hpp`](./kt-kernel/operators/moe-tp.hpp) |
+| CPU task submission and overlap | [`kt-kernel/cpu_backend/`](./kt-kernel/cpu_backend/) |
+| End-to-end launch and profiling scripts | [`kt-kernel/sgl_kt/`](./kt-kernel/sgl_kt/) |
+| AMX and NUMA microbenchmarks | [`kt-kernel/bench/`](./kt-kernel/bench/) |
+
+## Running the Artifact
+
+The artifact targets Linux with an Intel AMX-BF16 CPU, a CUDA-capable GPU, and a compatible SGLang environment. Model weights are not included.
+
+Install the modified kernel package, set `MODEL_ROOT` to the model directory, and use the provided launch script:
+
+```bash
+cd kt-kernel
+pip install .
+export MODEL_ROOT=/path/to/models
+bash sgl_kt/run_model.sh
+```
+
+The scripts expose model, batch-size, CPU-thread, GPU-expert, and sequence-length settings through environment variables. See [`kt-kernel/sgl_kt/`](./kt-kernel/sgl_kt/) for the benchmark and profiling entry points.
+
+## Upstream Project
+
+LayerScopeV2 is implemented as a research fork of [KTransformers](https://github.com/kvcache-ai/ktransformers).
+
+This branch is based on upstream commit [`5bd5c8f`](https://github.com/kvcache-ai/ktransformers/commit/5bd5c8f750e95eddd55730f58f36b06017b24e2f) and retains the original Apache-2.0 license.
+
+The upstream KTransformers documentation follows below.
+
+---
+
+# KTransformers
+
 <div align="center">
   <p align="center">
 
