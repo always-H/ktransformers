@@ -1,202 +1,202 @@
-# LayerScopeV2
+# LayerScope and LayerScopeV2
 
-This `master` branch contains the implementation artifact for **LayerScopeV2: Predictive Cross-Layer Scheduling with AMX Acceleration for Memory-Bound MoE Inference**.
+[English](README.md) | [简体中文](README_ZH.md)
 
-LayerScopeV2 integrates LayerScope's predictive cross-layer scheduling into KTransformers+SGLang (KT+SGL) and co-designs scheduling with accelerated AMX expert execution.
+Predictive cross-layer scheduling and AMX-accelerated CPU-GPU co-execution for memory-constrained Mixture-of-Experts (MoE) inference.
 
-## What LayerScopeV2 Adds
+## Overview
 
-- **Checkpoint-native BF16 AMX execution.** Hand-written AVX-512 gather and AMX GEMM assembly consume row-major checkpoint weights directly, avoiding runtime weight repacking and persistent duplicate layouts.
-- **AMX-aware cost gating.** An aggregate CPU latency model enables dynamic expert placement and cross-layer prefetching only when their predicted benefit exceeds computation, transfer, and scheduling costs.
-- **Scheduler Overlap.** Experts committed to CPU execution start before the remaining placement decisions finish, hiding most scheduler latency behind useful CPU work.
+Although an MoE model activates only a few experts for each token, all expert weights must remain available in memory. When they do not fit in GPU memory, the system must choose between transferring an expert to the GPU and executing it directly on the CPU. End-to-end performance therefore depends on expert placement, PCIe transfers, CPU/GPU execution, and scheduling overhead—not on GPU computation alone.
 
-On an NVIDIA RTX A6000 and an Intel Xeon Gold 6430, LayerScopeV2 reduces prefill time to first token by 13.4%-48.0% and reaches up to 2.16x the decoding throughput of KT+SGL across four MoE models.
+LayerScope and LayerScopeV2 address this problem from two successive angles.
 
-## Artifact Layout
+### LayerScope (ICS 2026)
 
-| Component | Location |
-| --- | --- |
-| Native row-major BF16 AMX kernels | [`kt-kernel/operators/amx/`](./kt-kernel/operators/amx/) |
-| Cost-aware scheduling and expert dispatch | [`kt-kernel/python/experts_base.py`](./kt-kernel/python/experts_base.py), [`kt-kernel/operators/moe-tp.hpp`](./kt-kernel/operators/moe-tp.hpp) |
-| CPU task submission and overlap | [`kt-kernel/cpu_backend/`](./kt-kernel/cpu_backend/) |
-| End-to-end launch and profiling scripts | [`kt-kernel/sgl_kt/`](./kt-kernel/sgl_kt/) |
-| AMX and NUMA microbenchmarks | [`kt-kernel/bench/`](./kt-kernel/bench/) |
+LayerScope is a prediction-driven expert scheduling system for multi-batch MoE inference on commodity and legacy CPU-GPU servers. It uses future routing information to coordinate computation and data movement across layer boundaries:
 
-## Running the Artifact
+- **LLaPor, a layer-aware predictor:** distinguishes near-input, near-output, and middle layer groups, and uses their routing and hidden-state characteristics to predict experts in subsequent layers. It supports online continuous learning.
+- **PreSched, a prefetch-aware cross-layer scheduler:** jointly considers current-layer demand and predicted next-layer demand. Under a shared PCIe budget, it chooses CPU execution, on-demand GPU loading, or cross-layer prefetching according to their estimated global benefit.
+- **AsyncIO, an asynchronous I/O optimizer:** uses fixed transfer buffers, fine-grained expert chunks, and multiple streams to overlap expert transfers with CPU/GPU computation.
 
-The artifact targets Linux with an Intel AMX-BF16 CPU, a CUDA-capable GPU, and a compatible SGLang environment. Model weights are not included.
+LayerScope targets platforms where limited GPU memory and PCIe latency make naïve on-demand expert loading inefficient.
 
-Install the modified kernel package, set `MODEL_ROOT` to the model directory, and use the provided launch script:
+### LayerScopeV2 (submitted to TACO)
+
+LayerScopeV2 brings LayerScope's predictive scheduling foundation to KTransformers+SGLang (KT+SGL) and redesigns it for AMX-accelerated CPU execution. Faster CPU experts change both the weight-layout requirements and the point at which scheduling becomes profitable. LayerScopeV2 therefore adds:
+
+- **Checkpoint-native BF16 AMX kernels:** hand-written AVX-512 gathering and AMX GEMM kernels directly consume row-major BF16 checkpoint weights. Only transient activations are reorganized, avoiding runtime weight quantization or repacking and persistent duplicate weight layouts.
+- **AMX-aware Cost-Aware Scheduling:** an aggregate AMX thread-pool latency model enables dynamic expert placement and cross-layer prefetching only when their predicted benefit exceeds computation, transfer, and scheduling costs. Unprofitable scheduling is bypassed.
+- **Scheduler Overlap:** experts committed to CPU execution are submitted before the remaining placement decisions finish, hiding most scheduler latency behind useful CPU work.
+
+This repository hosts the KTransformers-side LayerScopeV2 artifact, including the native BF16 AMX kernels, CPU/GPU expert-mask interfaces, and launch/profiling scripts. The matching [always-H/sglang](https://github.com/always-H/sglang) repository provides the cross-layer predictor, cost-aware runtime scheduling, prefetching, and Scheduler Overlap integration. The Quick Start below runs the combined LayerScopeV2 system.
+
+## Key Results
+
+### LayerScope: end-to-end throughput
+
+On NVIDIA V100 and A100 GPUs with a 24 GB memory budget, LayerScope achieves up to **141% higher end-to-end throughput than Klotski** and **70.8% higher throughput than HybriMoE** across DeepSeek-V2-Lite, Mixtral-8x7B, Qwen3-30B-A3B, and Moonlight-16B-A3B at batch sizes 4-64.
+
+![LayerScope throughput comparison on V100 and A100](doc/assets/layerscope-throughput.png)
+
+*LayerScope paper, Figure 11: end-to-end throughput across four MoE models and two GPU platforms.*
+
+### LayerScopeV2: prefill and decoding
+
+On an NVIDIA RTX A6000 and an Intel Xeon Gold 6430, LayerScopeV2 reduces prefill time to first token (TTFT) by **13.4%-48.0%** (up to **1.92x speedup**) and achieves up to **2.16x the end-to-end decoding throughput of KT+SGL**. The evaluation covers Qwen2-57B-A14B, DeepSeek-V2-Lite, Qwen3-30B-A3B, and Mixtral-8x7B.
+
+![LayerScopeV2 prefill TTFT and decoding throughput](doc/assets/layerscope-v2-end-to-end.png)
+
+*LayerScopeV2 paper, Figure 8: prefill TTFT and decoding throughput; the dashed lines show speedup over KT+SGL and scheduler transitions.*
+
+## Quick Start
+
+The following example runs LayerScopeV2 with DeepSeek-V2-Lite in BF16 on one GPU. Both devices use the original BF16 checkpoint as their weight source; no CPU-weight quantization or layout conversion is required.
+
+### 1. Requirements
+
+- Linux x86-64, Python 3.10 or newer (Python 3.11 recommended), and a working C/C++ build toolchain.
+- An Intel CPU with AMX-BF16 and AVX-512 support, an NVIDIA CUDA GPU, and enough host memory for the model's expert weights.
+- Model weights downloaded locally; model files are not included in either repository.
+
+The commands below use Conda and Debian/Ubuntu package names; adapt them to your environment when necessary. The current scheduling and calibration path targets BF16 SiLU experts on a single GPU with TP=1/PP=1. DeepSeek-V2-Lite is the reference configuration below. Other models and hardware require appropriate resident-expert settings, recalibration, and independent validation.
+
+### 2. Build the LayerScopeV2 kernel
 
 ```bash
+git clone --branch master https://github.com/always-H/ktransformers.git
+cd ktransformers
+git submodule update --init --recursive
+
+conda create -n layerscope python=3.11 -y
+conda activate layerscope
+
 cd kt-kernel
-pip install .
+sudo apt update
+sudo apt install -y build-essential libhwloc-dev pkg-config
+python -m pip install --upgrade pip setuptools wheel cmake pybind11
+./install.sh
+python -c "from kt_kernel import kt_kernel_ext; print('kt-kernel import OK')"
+```
+
+`install.sh` detects the local CPU and builds the native extension.
+
+### 3. Install the matching SGLang runtime
+
+Use the LayerScopeV2 runtime fork rather than stock SGLang. Starting from the `kt-kernel` directory above:
+
+```bash
+cd ../..
+git clone https://github.com/always-H/sglang.git
+cd sglang
+pip install -e python
+export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+Keep this kernel and runtime in the same Python environment for calibration, serving, and benchmarking.
+
+### 4. Configure and calibrate the scheduler
+
+Replace `MODEL_ROOT` with the directory containing your models. The values below use one GPU, 32 CPU workers, one NUMA pool, and six resident GPU experts for DeepSeek-V2-Lite.
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+export SGLANG_KT_ENABLE_SCHEDULER=1
+export SGLANG_KT_ENABLE_EARLY_CPU=1
+export SGLANG_KT_ENABLE_PREFETCH=1
+unset SGLANG_KT_BUDGET_PROFILE SGLANG_KT_SCHEDULER_TRANSFER_LIMIT
+
 export MODEL_ROOT=/path/to/models
-bash sgl_kt/run_model.sh
+export MODEL_NAME=DeepSeek-V2-Lite
+export MODEL_PATH="$MODEL_ROOT/$MODEL_NAME"
+export KT_WEIGHT_PATH="$MODEL_PATH"
+export CPU_THREADS=32
+export NUMA_POOLS=1
+export NUM_GPU_EXPERTS=6
+export BUDGET_PROFILE="$PWD/kt-budget.json"
+
+python -m sglang.srt.layers.moe.kt_budget \
+  --model-config "$MODEL_PATH/config.json" \
+  --kt-cpuinfer "$CPU_THREADS" \
+  --kt-threadpool-count "$NUMA_POOLS" \
+  --kt-num-gpu-experts "$NUM_GPU_EXPERTS" \
+  --batch-size 4 \
+  --budget-max-tokens 512 \
+  --budget-output "$BUDGET_PROFILE"
 ```
 
-The scripts expose model, batch-size, CPU-thread, GPU-expert, and sequence-length settings through environment variables. See [`kt-kernel/sgl_kt/`](./kt-kernel/sgl_kt/) for the benchmark and profiling entry points.
+Calibration measures the local AMX, GPU, PCIe, and scheduling paths and produces a reusable cost-aware scheduling profile. This example starts at four tokens and doubles the load up to 512, covering 4, 8, 16, 32, 64, 128, 256, and 512. Adjust `--batch-size` and `--budget-max-tokens` to cover the expected MoE token loads. Use a new output path when recalibrating because existing profiles are not overwritten. Without a profile or an explicit diagnostic transfer limit, dynamic scheduling remains bypassed.
 
-## Upstream Project
+### 5. Launch the server and send a request
 
-LayerScopeV2 is implemented as a research fork of [KTransformers](https://github.com/kvcache-ai/ktransformers).
+Keep the environment variables and numerical settings from the calibration step unchanged:
 
-This branch is based on upstream commit [`5bd5c8f`](https://github.com/kvcache-ai/ktransformers/commit/5bd5c8f750e95eddd55730f58f36b06017b24e2f) and retains the original Apache-2.0 license.
-
-The upstream KTransformers documentation follows below.
-
----
-
-# KTransformers
-
-<div align="center">
-  <p align="center">
-
-<picture>
-    <img alt="KTransformers" src="https://github.com/user-attachments/assets/d5a2492f-a415-4456-af99-4ab102f13f8b" width=50%>
-
-</picture>
-
-</p>
-  <h3>A Flexible Framework for Experiencing Cutting-edge LLM Inference/Fine-tune Optimizations</h3>
-  <strong><a href="#-overview">🎯 Overview</a> | <a href="#-kt-kernel---high-performance-inference-kernels">🚀 kt-kernel</a> | <a href="#-kt-sft---fine-tuning-framework">🎓 kt-sft</a> | <a href="#-citation">🔥 Citation</a> | <a href="https://github.com/kvcache-ai/ktransformers/issues/1582">🚀 Roadmap(2025Q4)</a>  </strong>
-</div>
-
-## 🎯 Overview
-
-KTransformers is a research project focused on efficient inference and fine-tuning of large language models through CPU-GPU heterogeneous computing. The project has evolved into **two core modules**: [kt-kernel](https://github.com/kvcache-ai/ktransformers/tree/main/kt-kernel/) and [kt-sft](https://github.com/kvcache-ai/ktransformers/tree/main/kt-sft).
-
-## 🔥 Updates
-
-* **Jan 22, 2026**: Support [CPU-GPU Expert Scheduling](./doc/en/kt-kernel/experts-sched-Tutorial.md), [Native BF16 and FP8 per channel Precision](./doc/en/kt-kernel/Native-Precision-Tutorial.md) and [AutoDL unified fine-tuning and inference](./doc/zh/【云端低价训推】%20KTransformers%2BAutoDL%2BLlamaFactory：随用随租的低成本超大模型「微调%2B推理」一体化流程.pdf)
-* **Dec 24, 2025**: Support Native MiniMax-M2.1 inference. ([Tutorial](./doc/en/kt-kernel/MiniMax-M2.1-Tutorial.md))
-* **Dec 22, 2025**: Support RL-DPO fine-tuning with LLaMA-Factory. ([Tutorial](./doc/en/SFT/DPO_tutorial.md))
-* **Dec 5, 2025**: Support Native Kimi-K2-Thinking inference ([Tutorial](./doc/en/kt-kernel/Kimi-K2-Thinking-Native.md))
-* **Nov 6, 2025**: Support Kimi-K2-Thinking inference ([Tutorial](./doc/en/Kimi-K2-Thinking.md)) and fine-tune ([Tutorial](./doc/en/SFT_Installation_Guide_KimiK2.md))
-* **Nov 4, 2025**: KTransformers Fine-Tuning × LLaMA-Factory Integration. ([Tutorial](./doc/en/KTransformers-Fine-Tuning_User-Guide.md))
-* **Oct 27, 2025**: Support Ascend NPU. ([Tutorial](./doc/zh/DeepseekR1_V3_tutorial_zh_for_Ascend_NPU.md))
-* **Oct 10, 2025**: Integrating into SGLang. ([Roadmap](https://github.com/sgl-project/sglang/issues/11425), [Blog](https://lmsys.org/blog/2025-10-22-KTransformers/))
-* **Sept 11, 2025**: Support Qwen3-Next. ([Tutorial](./doc/en/Qwen3-Next.md))
-* **Sept 05, 2025**: Support Kimi-K2-0905. ([Tutorial](./doc/en/Kimi-K2.md))
-* **July 26, 2025**: Support SmallThinker and GLM4-MoE. ([Tutorial](./doc/en/SmallThinker_and_Glm4moe.md))
-* **July 11, 2025**: Support Kimi-K2. ([Tutorial](./doc/en/Kimi-K2.md))
-* **June 30, 2025**: Support 3-layer (GPU-CPU-Disk) [prefix cache](./doc/en/prefix_cache.md) reuse.
-* **May 14, 2025**: Support Intel Arc GPU ([Tutorial](./doc/en/xpu.md)).
-* **Apr 29, 2025**: Support AMX-Int8、 AMX-BF16 and Qwen3MoE ([Tutorial](./doc/en/AMX.md))
-* **Apr 9, 2025**: Experimental support for LLaMA 4 models ([Tutorial](./doc/en/llama4.md)).
-* **Apr 2, 2025**: Support Multi-concurrency. ([Tutorial](./doc/en/balance-serve.md)).
-* **Mar 15, 2025**: Support ROCm on AMD GPU ([Tutorial](./doc/en/ROCm.md)).
-* **Mar 5, 2025**: Support unsloth 1.58/2.51 bits weights and [IQ1_S/FP8 hybrid](./doc/en/fp8_kernel.md) weights. Support 139K [Longer Context](./doc/en/DeepseekR1_V3_tutorial.md#v022--v023-longer-context--fp8-kernel) for DeepSeek-V3 and R1 in 24GB VRAM.
-* **Feb 25, 2025**: Support [FP8 GPU kernel](./doc/en/fp8_kernel.md) for DeepSeek-V3 and R1; [Longer Context](./doc/en/DeepseekR1_V3_tutorial.md#v022-longer-context).
-* **Feb 15, 2025**: Longer Context (from 4K to 8K for 24GB VRAM) & Slightly Faster Speed （+15%, up to 16 Tokens/s), update [docs](./doc/en/DeepseekR1_V3_tutorial.md) and [online books](https://kvcache-ai.github.io/ktransformers/).
-* **Feb 10, 2025**: Support Deepseek-R1 and V3 on single (24GB VRAM)/multi gpu and 382G DRAM, up to 3~28x speedup. For detailed show case and reproduction tutorial, see [here](./doc/en/DeepseekR1_V3_tutorial.md).
-* **Aug 28, 2024**: Decrease DeepseekV2's required VRAM from 21G to 11G.
-* **Aug 15, 2024**: Update detailed [tutorial](doc/en/injection_tutorial.md) for injection and multi-GPU.
-* **Aug 14, 2024**: Support llamfile as linear backend.
-* **Aug 12, 2024**: Support multiple GPU; Support new model: mixtral 8\*7B  and 8\*22B; Support q2k, q3k, q5k dequant on gpu.
-* **Aug 9, 2024**: Support windows native.
-
----
-
-## 📦 Core Modules
-
-### 🚀 [kt-kernel](./kt-kernel/) - High-Performance Inference Kernels
-
-CPU-optimized kernel operations for heterogeneous LLM inference.
-
-<img width="1049" height="593" alt="image" src="https://github.com/user-attachments/assets/68f423da-3f55-4025-bdc9-9ceaa554f00b" />
-
-
-**Key Features:**
-- **AMX/AVX Acceleration**: Intel AMX and AVX512/AVX2 optimized kernels for INT4/INT8 quantized inference
-- **MoE Optimization**: Efficient Mixture-of-Experts inference with NUMA-aware memory management
-- **Quantization Support**: CPU-side INT4/INT8 quantized weights, GPU-side GPTQ support
-- **Easy Integration**: Clean Python API for SGLang and other frameworks
-
-**Quick Start:**
 ```bash
-cd kt-kernel
-pip install .
+export SGLANG_KT_BUDGET_PROFILE="$BUDGET_PROFILE"
+
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --served-model-name layerscope-demo \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --kt-weight-path "$KT_WEIGHT_PATH" \
+  --kt-method BF16 \
+  --kt-cpuinfer "$CPU_THREADS" \
+  --kt-threadpool-count "$NUMA_POOLS" \
+  --kt-num-gpu-experts "$NUM_GPU_EXPERTS" \
+  --tensor-parallel-size 1 \
+  --trust-remote-code \
+  --disable-cuda-graph
 ```
 
-**Use Cases:**
+From another terminal, send an OpenAI-compatible request:
 
-- CPU-GPU hybrid inference for large MoE models
-- Integration with SGLang for production serving
-- Heterogeneous expert placement (hot experts on GPU, cold experts on CPU)
-
-**Performance Examples:**
-| Model | Hardware Configuration | Total Throughput | Output Throughput |
-|-------|------------------------|------------------|-------------------|
-| DeepSeek-R1-0528 (FP8) | 8×L20 GPU + Xeon Gold 6454S | 227.85 tokens/s | 87.58 tokens/s (8-way concurrency) |
-
-👉 **[Full Documentation →](./kt-kernel/README.md)**
-
----
-
-### 🎓 [kt-sft](./kt-sft/) - Fine-Tuning Framework
-
-KTransformers × LLaMA-Factory integration for ultra-large MoE model fine-tuning.
-
-![image-20251011010558909](https://raw.githubusercontent.com/kvcache-ai/ktransformers/main/doc/assets/image-20251011010558909.png)
-
-**Key Features:**
-
-- **Resource Efficient**: Fine-tune 671B DeepSeek-V3 with just **70GB GPU memory** + 1.3TB RAM
-- **LoRA Support**: Full LoRA fine-tuning with heterogeneous acceleration
-- **LLaMA-Factory Integration**: Seamless integration with popular fine-tuning framework
-- **Production Ready**: Chat, batch inference, and metrics evaluation
-
-**Performance Examples:**
-
-| Model | Configuration | Throughput | GPU Memory |
-|-------|--------------|------------|------------|
-| DeepSeek-V3 (671B) | LoRA + AMX | ~40 tokens/s | 70GB (multi-GPU) |
-| DeepSeek-V2-Lite (14B) | LoRA + AMX | ~530 tokens/s | 6GB |
-
-**Quick Start:**
 ```bash
-cd kt-sft
-# Install environment following kt-sft/README.md
-USE_KT=1 llamafactory-cli train examples/train_lora/deepseek3_lora_sft_kt.yaml
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "layerscope-demo",
+    "messages": [{"role": "user", "content": "Give a short introduction to MoE inference."}],
+    "max_tokens": 32
+  }'
 ```
 
-👉 **[Full Documentation →](./kt-sft/README.md)**
+This single-request call is an API smoke test, not a scheduling performance test. Its decode load is normally one token, outside the calibrated range, so it is not expected to exercise dynamic scheduling. Use the calibrated fixed-batch benchmark below to evaluate scheduling behavior.
 
----
+### 6. Run fixed-batch benchmarks (optional)
 
-## 🔥 Citation
+Stop the server before using the same GPU for benchmarking. The following command uses the model and worker settings exported above and writes per-batch logs under `kt-kernel/logs/`:
 
-If you use KTransformers in your research, please cite our paper:
+```bash
+cd ../ktransformers/kt-kernel
+BATCH_SIZES="4 8 16 32 64" INPUT_LEN=512 OUTPUT_LEN=32 \
+  bash sgl_kt/run_bench_one_batch.sh
+```
+
+Additional launch and profiling entry points are available in [`kt-kernel/sgl_kt/`](kt-kernel/sgl_kt/). For static, on-demand, and prefetch comparisons, use the runtime repository's [`multi_batch_benchmark.sh`](https://github.com/always-H/sglang/blob/main/benchmark/kt/multi_batch_benchmark.sh).
+
+## Citation
+
+If you use LayerScope or LayerScopeV2 in your research, please cite the corresponding paper.
+
+### LayerScope
 
 ```bibtex
-@inproceedings{10.1145/3731569.3764843,
-  title = {KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models},
-  author = {Chen, Hongtao and Xie, Weiyu and Zhang, Boxin and Tang, Jingqi and Wang, Jiahao and Dong, Jianwei and Chen, Shaoyuan and Yuan, Ziwei and Lin, Chen and Qiu, Chengyu and Zhu, Yuening and Ou, Qingliang and Liao, Jiaqi and Chen, Xianglin and Ai, Zhiyuan and Wu, Yongwei and Zhang, Mingxing},
-  booktitle = {Proceedings of the ACM SIGOPS 31st Symposium on Operating Systems Principles},
-  year = {2025}
+@inproceedings{yu2026layerscope,
+  title={LayerScope: Predictive Cross-Layer Scheduling for Efficient Multi-Batch MoE Inference on Legacy Servers},
+  author={Yu, Enda and Dong, Dezun and Zhang, Zhaoning and Bai, Zhe and Yang, Weiling and Wang, Haojie and Li, Dongsheng and Wu, Yongwei and Liao, Xiangke},
+  booktitle={Proceedings of the 40th ACM International Conference on Supercomputing},
+  pages={881--892},
+  year={2026}
 }
 ```
 
-## 👥 Contributors & Team
+### LayerScopeV2
 
-Developed and maintained by:
-- [MADSys Lab](https://madsys.cs.tsinghua.edu.cn/) @ Tsinghua University
-- [Approaching.AI](http://approaching.ai/)
-- [9#AISoft](https://github.com/aisoft9)
-- Community contributors
-
-We welcome contributions! Please feel free to submit issues and pull requests.
-
-## 💬 Community & Support
-
-- **GitHub Issues**: [Report bugs or request features](https://github.com/kvcache-ai/ktransformers/issues)
-- **WeChat Group**: See [archive/WeChatGroup.png](./archive/WeChatGroup.png)
-
-## 📦 KT original Code
-
-The original integrated KTransformers framework has been archived to the [`archive/`](./archive/) directory for reference. The project now focuses on the two core modules above for better modularity and maintainability.
-
-For the original documentation with full quick-start guides and examples, see:
-- [archive/README.md](./archive/README.md) (English)
-- [archive/README_ZH.md](./archive/README_ZH.md) (中文)
+```bibtex
+@inproceedings{bai2026layerscopev2,
+  title={LayerScopeV2: Predictive Cross-Layer Scheduling with AMX Acceleration for Memory-Bound MoE Inference},
+  author={Bai, Zhe and Yu, Enda and Yang, Weiling and Dong, Dezun},
+  booktitle={submitted to TACO},
+  year={2026}
+}
+```
