@@ -28,7 +28,7 @@ LayerScopeV2 将 LayerScope 的预测调度基础引入 KTransformers+SGLang（K
 - **AMX 感知的成本感知调度（Cost-Aware Scheduling）：** 通过聚合 AMX 线程池时延模型，仅在预测收益高于计算、传输和调度成本时，才启用动态专家放置与跨层预取；无收益的调度会被直接绕过。
 - **调度重叠（Scheduler Overlap）：** 在其余放置决策完成前，提前提交确定留在 CPU 上执行的专家，将大部分调度时延隐藏在有效 CPU 计算之后。
 
-本仓库发布 LayerScopeV2 的 KTransformers 侧实现，包括原生 BF16 AMX 内核、CPU/GPU 专家掩码接口以及启动与分析脚本。配套的 [always-H/sglang](https://github.com/always-H/sglang) 仓库提供跨层预测器、成本感知运行时调度、预取和 Scheduler Overlap 集成。下面的快速开始运行的是两者组合后的完整 LayerScopeV2 系统。
+本仓库发布 LayerScopeV2 的 KTransformers 侧实现，包括原生 BF16 AMX 内核、CPU/GPU 专家掩码接口以及启动与分析脚本。配套的 [always-H/sglang](https://github.com/always-H/sglang) 仓库已作为 [`third_party/sglang`](third_party/sglang) submodule 随本仓库提供，用于实现跨层预测器、成本感知运行时调度、预取和 Scheduler Overlap 集成。下面的快速开始运行的是两者组合后的完整 LayerScopeV2 系统。
 
 ## 关键结果（Key Results）
 
@@ -80,14 +80,12 @@ python -c "from kt_kernel import kt_kernel_ext; print('kt-kernel import OK')"
 
 `install.sh` 会检测本机 CPU 并构建原生扩展。
 
-### 3. 安装配套的 SGLang 运行时
+### 3. 安装随仓库提供的 SGLang 运行时
 
-请使用 LayerScopeV2 配套 fork，而不是原版 SGLang。从上面的 `kt-kernel` 目录继续执行：
+第 2 步的递归 submodule 初始化已将 LayerScopeV2 运行时拉取到 `third_party/sglang`；请使用这个随仓库提供的 fork，而不是原版 SGLang。从上面的 `kt-kernel` 目录继续执行：
 
 ```bash
-cd ../..
-git clone https://github.com/always-H/sglang.git
-cd sglang
+cd ../third_party/sglang
 pip install -e python
 export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
 ```
@@ -167,7 +165,7 @@ curl http://localhost:8000/v1/chat/completions \
 在同一 GPU 上运行 benchmark 前，请先停止服务。下面的命令会沿用上面导出的模型与 worker 配置，并将各 batch 的日志写入 `kt-kernel/logs/`：
 
 ```bash
-cd ../ktransformers/kt-kernel
+cd ../../kt-kernel
 BATCH_SIZES="4 8 16 32 64" INPUT_LEN=512 OUTPUT_LEN=32 \
   bash sgl_kt/run_bench_one_batch.sh
 ```

@@ -28,7 +28,7 @@ LayerScopeV2 brings LayerScope's predictive scheduling foundation to KTransforme
 - **AMX-aware Cost-Aware Scheduling:** an aggregate AMX thread-pool latency model enables dynamic expert placement and cross-layer prefetching only when their predicted benefit exceeds computation, transfer, and scheduling costs. Unprofitable scheduling is bypassed.
 - **Scheduler Overlap:** experts committed to CPU execution are submitted before the remaining placement decisions finish, hiding most scheduler latency behind useful CPU work.
 
-This repository hosts the KTransformers-side LayerScopeV2 artifact, including the native BF16 AMX kernels, CPU/GPU expert-mask interfaces, and launch/profiling scripts. The matching [always-H/sglang](https://github.com/always-H/sglang) repository provides the cross-layer predictor, cost-aware runtime scheduling, prefetching, and Scheduler Overlap integration. The Quick Start below runs the combined LayerScopeV2 system.
+This repository hosts the KTransformers-side LayerScopeV2 artifact, including the native BF16 AMX kernels, CPU/GPU expert-mask interfaces, and launch/profiling scripts. The matching [always-H/sglang](https://github.com/always-H/sglang) repository is included as the [`third_party/sglang`](third_party/sglang) submodule and provides the cross-layer predictor, cost-aware runtime scheduling, prefetching, and Scheduler Overlap integration. The Quick Start below runs the combined LayerScopeV2 system.
 
 ## Key Results
 
@@ -80,14 +80,12 @@ python -c "from kt_kernel import kt_kernel_ext; print('kt-kernel import OK')"
 
 `install.sh` detects the local CPU and builds the native extension.
 
-### 3. Install the matching SGLang runtime
+### 3. Install the bundled SGLang runtime
 
-Use the LayerScopeV2 runtime fork rather than stock SGLang. Starting from the `kt-kernel` directory above:
+The recursive submodule initialization in step 2 already fetched the LayerScopeV2 runtime into `third_party/sglang`; use this bundled fork rather than stock SGLang. Starting from the `kt-kernel` directory above:
 
 ```bash
-cd ../..
-git clone https://github.com/always-H/sglang.git
-cd sglang
+cd ../third_party/sglang
 pip install -e python
 export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
 ```
@@ -167,7 +165,7 @@ This single-request call is an API smoke test, not a scheduling performance test
 Stop the server before using the same GPU for benchmarking. The following command uses the model and worker settings exported above and writes per-batch logs under `kt-kernel/logs/`:
 
 ```bash
-cd ../ktransformers/kt-kernel
+cd ../../kt-kernel
 BATCH_SIZES="4 8 16 32 64" INPUT_LEN=512 OUTPUT_LEN=32 \
   bash sgl_kt/run_bench_one_batch.sh
 ```
